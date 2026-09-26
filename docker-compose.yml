@@ -5,4 +5,4 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
-      - ./plans.json:/app/plans.json:ro
+      - ./catalog.json:/app/catalog.json:ro

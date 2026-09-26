@@ -1,45 +1,127 @@
-"""Admin commands and premium-chat membership guard."""
+"""Admin text commands and the premium-chat membership guard."""
 from __future__ import annotations
 
-import asyncio
 import html
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import JOIN_TRANSITION, BaseFilter, ChatMemberUpdatedFilter, Command, CommandObject
-from aiogram.types import ChatMemberUpdated, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 
 from ..config import Config
 from ..db import DB, now
-from ..services import Access, fmt_amount, fmt_date
+from ..i18n import t
+from ..services import Access, Orders, fmt_date
 
 router = Router(name="admin")
 
 
 class IsAdmin(BaseFilter):
-    async def __call__(self, msg: Message, cfg: Config) -> bool:
-        return bool(msg.from_user) and cfg.is_admin(msg.from_user.id)
+    async def __call__(self, event: Message | CallbackQuery, cfg: Config) -> bool:
+        return bool(event.from_user) and cfg.is_admin(event.from_user.id)
 
 
 router.message.filter(IsAdmin())
 
-HELP = """<b>Admin commands</b>
-/stats — revenue, users, subscriptions
-/user &lt;id|@username&gt; — user details
-/grant &lt;id|@username&gt; &lt;days|life&gt; — give / extend access
-/revoke &lt;id|@username&gt; — remove access now
-/promo &lt;CODE&gt; &lt;percent&gt; [max_uses] [valid_days] — create promo (100% = free)
-/promos — list promo codes
-/delpromo &lt;CODE&gt; — delete promo code
-/broadcast [all|active|inactive] — reply to any message to send it to users
-/payouts — pending referral payouts
-/paidout &lt;id&gt; — mark payout as sent
-/chatid — run inside a group to see its id (for a channel: forward any channel post here)"""
+
+async def _target(msg: Message, db: DB, arg: str | None):
+    if not arg:
+        await msg.answer("Specify a user id or @username.")
+        return None
+    user = await db.find_user(arg.split()[0])
+    if not user:
+        await msg.answer("User not found (they must /start the bot first).")
+    return user
 
 
-@router.message(Command("admin"))
-async def admin_help(msg: Message):
-    await msg.answer(HELP)
+async def _sub_product(msg: Message, db: DB, pid: str | None):
+    products = [p for p in await db.products(active_only=False) if p["kind"] == "sub"]
+    if pid:
+        p = next((p for p in products if p["id"] == pid), None)
+        if not p:
+            await msg.answer("Unknown product id. Subscription products: "
+                             + ", ".join(f"<code>{p['id']}</code> ({html.escape(p['title'])})" for p in products))
+        return p
+    if not products:
+        await msg.answer("No subscription products exist yet.")
+        return None
+    return products[0]
+
+
+@router.message(Command("user"))
+async def user_info(msg: Message, command: CommandObject, db: DB):
+    user = await _target(msg, db, command.args)
+    if not user:
+        return
+    lines = []
+    for sub in await db.user_subs(user["id"]):
+        p = await db.product(sub["product_id"])
+        state = "active until" if sub["active"] and sub["expires_at"] > now() else "expired"
+        lines.append(f"  • {html.escape(p['title'] if p else sub['product_id'])}: {state} {fmt_date(sub['expires_at'])}")
+    for p in await db.user_purchases(user["id"]):
+        lines.append(f"  • 📦 {html.escape(p['title'])}")
+    await msg.answer(
+        f"👤 <code>{user['id']}</code> @{html.escape(user['username'] or '-')} {html.escape(user['first_name'] or '')}"
+        f" · {user['lang'] or '?'}\nJoined: {fmt_date(user['created_at'])}\n"
+        f"Access:\n" + ("\n".join(lines) or "  none") + "\n"
+        f"Paid invoices: {await db.paid_count(user['id'])}\n"
+        f"Referrer: {user['referrer_id'] or '-'} · invited: {await db.referral_count(user['id'])}\n"
+        f"Referral balance: ${user['ref_balance_cents'] / 100:.2f}"
+    )
+
+
+@router.message(Command("grant"))
+async def grant(msg: Message, command: CommandObject, db: DB, orders: Orders):
+    parts = (command.args or "").split()
+    if len(parts) not in (2, 3) or not (parts[1].isdigit() or parts[1].lower() == "life"):
+        return await msg.answer("Usage: /grant &lt;id|@username&gt; &lt;days|life&gt; [product_id]")
+    user = await _target(msg, db, parts[0])
+    product = user and await _sub_product(msg, db, parts[2] if len(parts) == 3 else None)
+    if not user or not product:
+        return
+    days = 0 if parts[1].lower() == "life" else int(parts[1])
+    await orders.grant(user["id"], product["id"], "manual", days, t(user["lang"], "granted"))
+    sub = await db.get_sub(user["id"], product["id"])
+    await msg.answer(f"✅ {html.escape(product['title'])} for <code>{user['id']}</code> until "
+                     f"{fmt_date(sub['expires_at'])}")
+
+
+@router.message(Command("revoke"))
+async def revoke(msg: Message, command: CommandObject, db: DB, access: Access):
+    parts = (command.args or "").split()
+    user = await _target(msg, db, parts[0] if parts else None)
+    if not user:
+        return
+    subs = await db.active_subs(user["id"])
+    if len(parts) > 1:
+        subs = [s for s in subs if s["product_id"] == parts[1]]
+    for sub in subs:
+        await db.deactivate_sub(user["id"], sub["product_id"])
+        await access.remove_product(user["id"], sub["product_id"])
+    await msg.answer(f"⛔ Revoked {len(subs)} subscription(s) for <code>{user['id']}</code>")
+
+
+@router.message(Command("refund"))
+async def refund(msg: Message, command: CommandObject, bot: Bot, db: DB, access: Access):
+    arg = (command.args or "").strip()
+    inv = await db.get_invoice(int(arg)) if arg.isdigit() else None
+    if not inv or inv["status"] != "paid" or inv["method"] != "XTR":
+        return await msg.answer("Usage: /refund &lt;invoice_id&gt; — only paid Telegram Stars invoices can be "
+                                "refunded automatically. Crypto refunds must be sent manually from your wallet.")
+    try:
+        await bot.refund_star_payment(inv["user_id"], inv["signature"].removeprefix("stars:"))
+    except TelegramAPIError as e:
+        return await msg.answer(f"❌ Refund failed: {html.escape(str(e))}")
+    await db.mark_refunded(inv["id"])
+    product = await db.product(inv["product_id"])
+    if product and product["kind"] == "digital":
+        await db.remove_purchase(inv["id"])
+    else:
+        await db.deactivate_sub(inv["user_id"], inv["product_id"])
+        await access.remove_product(inv["user_id"], inv["product_id"])
+    lang = await db.lang(inv["user_id"])
+    await access.safe_send(inv["user_id"], t(lang, "refunded", title=html.escape(inv["title"])))
+    await msg.answer(f"↩️ Invoice #{inv['id']} refunded ({inv['amount_units']} ⭐) and access removed.")
 
 
 @router.message(Command("chatid"))
@@ -53,168 +135,6 @@ async def forwarded_chat_id(msg: Message):
     await msg.answer(f"{html.escape(chat.title or '')} id: <code>{chat.id}</code>")
 
 
-@router.message(Command("stats"))
-async def stats(msg: Message, db: DB):
-    s = await db.stats()
-    lines = [
-        "📊 <b>Stats</b>",
-        f"Users: <b>{s['users']}</b> (+{s['users_today']} today, {s['blocked']} blocked bot)",
-        f"Active subscriptions: <b>{s['active']}</b>",
-        f"Sales: <b>{s['sales']}</b> · open invoices: {s['pending']}",
-        f"Revenue today: <b>${s['rev_today']:.2f}</b>",
-        f"Revenue 30d: <b>${s['rev_30d']:.2f}</b>",
-        f"Revenue total: <b>${s['rev_total']:.2f}</b>",
-    ]
-    for t in s["by_token"]:
-        lines.append(f"  • {t['token']}: {fmt_amount(t['units'], t['token'])} in {t['n']} sales (${t['usd']:.2f})")
-    if s["ref_owed"]:
-        lines.append(f"Referral commissions owed: ${s['ref_owed']:.2f}")
-    await msg.answer("\n".join(lines))
-
-
-async def _target(msg: Message, db: DB, arg: str | None):
-    if not arg:
-        await msg.answer("Specify a user id or @username.")
-        return None
-    user = await db.find_user(arg.split()[0])
-    if not user:
-        await msg.answer("User not found (they must /start the bot first).")
-    return user
-
-
-@router.message(Command("user"))
-async def user_info(msg: Message, command: CommandObject, db: DB):
-    user = await _target(msg, db, command.args)
-    if not user:
-        return
-    sub = await db.get_sub(user["id"])
-    status = "none"
-    if sub:
-        status = ("active until " if sub["active"] and sub["expires_at"] > now() else "expired ") + fmt_date(
-            sub["expires_at"]) + f" ({sub['plan_id']})"
-    await msg.answer(
-        f"👤 <code>{user['id']}</code> @{html.escape(user['username'] or '-')} {html.escape(user['first_name'] or '')}\n"
-        f"Joined: {fmt_date(user['created_at'])}\nSubscription: {status}\n"
-        f"Paid invoices: {await db.paid_count(user['id'])}\n"
-        f"Referrer: {user['referrer_id'] or '-'} · invited: {await db.referral_count(user['id'])}\n"
-        f"Referral balance: ${user['ref_balance_cents'] / 100:.2f}"
-    )
-
-
-@router.message(Command("grant"))
-async def grant(msg: Message, command: CommandObject, db: DB, access: Access):
-    parts = (command.args or "").split()
-    if len(parts) != 2 or not (parts[1].isdigit() or parts[1].lower() == "life"):
-        return await msg.answer("Usage: /grant &lt;id|@username&gt; &lt;days|life&gt;")
-    user = await _target(msg, db, parts[0])
-    if not user:
-        return
-    days = 0 if parts[1].lower() == "life" else int(parts[1])
-    exp = await db.extend_sub(user["id"], "manual", days)
-    await msg.answer(f"✅ Access for <code>{user['id']}</code> until {fmt_date(exp)}")
-    await access.send_access(user["id"], "🎁 <b>You've been granted access!</b>")
-
-
-@router.message(Command("revoke"))
-async def revoke(msg: Message, command: CommandObject, db: DB, access: Access):
-    user = await _target(msg, db, command.args)
-    if not user:
-        return
-    await db.deactivate_sub(user["id"])
-    await access.remove(user["id"])
-    await msg.answer(f"⛔ Access revoked for <code>{user['id']}</code>")
-
-
-@router.message(Command("promo"))
-async def promo(msg: Message, command: CommandObject, db: DB):
-    parts = (command.args or "").split()
-    if len(parts) < 2 or not all(p.isdigit() for p in parts[1:]) or not 1 <= int(parts[1]) <= 100:
-        return await msg.answer("Usage: /promo CODE percent(1-100) [max_uses] [valid_days]")
-    max_uses = int(parts[2]) if len(parts) > 2 else 0
-    days = int(parts[3]) if len(parts) > 3 else 0
-    await db.add_promo(parts[0][:32], int(parts[1]), max_uses, now() + days * 86400 if days else 0)
-    await msg.answer(f"✅ Promo <b>{html.escape(parts[0].upper())}</b>: -{parts[1]}%, "
-                     f"uses: {max_uses or '∞'}, valid: {f'{days} days' if days else 'forever'}")
-
-
-@router.message(Command("promos"))
-async def promos(msg: Message, db: DB):
-    rows = await db.list_promos()
-    if not rows:
-        return await msg.answer("No promo codes.")
-    await msg.answer("\n".join(
-        f"<code>{r['code']}</code> -{r['percent']}% · used {r['uses']}/{r['max_uses'] or '∞'}"
-        + (f" · until {fmt_date(r['expires_at'])}" if r["expires_at"] else "")
-        for r in rows
-    ))
-
-
-@router.message(Command("delpromo"))
-async def delpromo(msg: Message, command: CommandObject, db: DB):
-    if not command.args:
-        return await msg.answer("Usage: /delpromo CODE")
-    await db.delete_promo(command.args.strip())
-    await msg.answer("🗑 Deleted.")
-
-
-@router.message(Command("broadcast"))
-async def broadcast(msg: Message, command: CommandObject, bot: Bot, db: DB):
-    src = msg.reply_to_message
-    if not src:
-        return await msg.answer("Reply to the message you want to broadcast with /broadcast [all|active|inactive]")
-    segment = (command.args or "all").strip().lower()
-    if segment not in ("all", "active", "inactive"):
-        return await msg.answer("Segment must be all, active or inactive.")
-    ids = await db.audience(segment)
-    status = await msg.answer(f"📣 Sending to {len(ids)} users…")
-
-    async def run():
-        ok = fail = 0
-        for uid in ids:
-            for _ in range(3):
-                try:
-                    await bot.copy_message(uid, msg.chat.id, src.message_id)
-                    ok += 1
-                    break
-                except TelegramRetryAfter as e:
-                    await asyncio.sleep(e.retry_after + 1)
-                except TelegramForbiddenError:
-                    await db.set_blocked(uid)
-                    fail += 1
-                    break
-                except TelegramAPIError:
-                    fail += 1
-                    break
-            await asyncio.sleep(0.05)  # stay under Telegram's ~30 msg/s limit
-        await bot.edit_message_text(f"📣 Broadcast done: {ok} delivered, {fail} failed.",
-                                    chat_id=status.chat.id, message_id=status.message_id)
-
-    asyncio.create_task(run())
-
-
-@router.message(Command("payouts"))
-async def payouts(msg: Message, db: DB):
-    rows = await db.pending_payouts()
-    if not rows:
-        return await msg.answer("No pending payouts.")
-    await msg.answer("\n\n".join(
-        f"#{r['id']} · user <code>{r['user_id']}</code> · <b>${r['amount_cents'] / 100:.2f}</b>\n"
-        f"<code>{r['wallet']}</code>" for r in rows
-    ) + "\n\nMark sent with /paidout &lt;id&gt;")
-
-
-@router.message(Command("paidout"))
-async def paidout(msg: Message, command: CommandObject, db: DB, access: Access):
-    if not (command.args or "").strip().isdigit():
-        return await msg.answer("Usage: /paidout &lt;id&gt;")
-    row = await db.complete_payout(int(command.args.strip()))
-    if not row:
-        return await msg.answer("Payout not found or already paid.")
-    await msg.answer(f"✅ Payout #{row['id']} marked as paid.")
-    await access.safe_send(row["user_id"], f"💸 Your referral payout of ${row['amount_cents'] / 100:.2f} "
-                                           f"was sent to <code>{row['wallet']}</code>. Thank you!")
-
-
 # ---------------------------------------------------------------- membership guard
 
 guard = Router(name="guard")
@@ -223,11 +143,11 @@ guard = Router(name="guard")
 @guard.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_join(event: ChatMemberUpdated, db: DB, cfg: Config, access: Access):
     """Remove anyone who joins a premium chat without an active subscription."""
-    if not cfg.strict_membership or event.chat.id not in cfg.premium_chats:
+    if not cfg.strict_membership or event.chat.id not in await db.all_premium_chats():
         return
     user = event.new_chat_member.user
-    if user.is_bot or cfg.is_admin(user.id) or await db.is_active(user.id):
+    if user.is_bot or cfg.is_admin(user.id) or await db.has_chat_access(user.id, event.chat.id):
         return
-    await access.remove(user.id)
-    await access.safe_send(user.id, "🔒 That chat is for subscribers only. Get access here: /start")
+    await access.remove(user.id, [event.chat.id])
+    await access.safe_send(user.id, t(await db.lang(user.id), "guard_kick"))
 

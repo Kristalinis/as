@@ -1,0 +1,41 @@
+{
+  "project_name": "Alpha Club",
+  "welcome_text": {
+    "en": "👋 Welcome to <b>Alpha Club</b> — our private members-only community.\n\n✅ Instant access after payment\n✅ Pay with Telegram Stars, SOL, USDC or USDT\n✅ Renew any time — unused days roll over\n\nTap <b>Plans &amp; shop</b> to join.",
+    "lt": "👋 Sveiki atvykę į <b>Alpha Club</b> — mūsų privačią narių bendruomenę.\n\n✅ Prieiga iškart po apmokėjimo\n✅ Mokėkite Telegram Stars, SOL, USDC arba USDT\n✅ Pratęskite bet kada — likusios dienos nepradingsta\n\nSpauskite <b>Planai ir parduotuvė</b>.",
+    "ru": "👋 Добро пожаловать в <b>Alpha Club</b> — наше закрытое сообщество.\n\n✅ Доступ сразу после оплаты\n✅ Оплата Telegram Stars, SOL, USDC или USDT\n✅ Продление в любой момент — оставшиеся дни сохраняются\n\nНажмите <b>Тарифы и магазин</b>."
+  },
+  "products": [
+    {
+      "id": "vip",
+      "kind": "subscription",
+      "title": "VIP Club",
+      "description": "Everything: private channel + VIP chat.",
+      "chats": [],
+      "plans": [
+        {"id": "vip_m1", "title": "1 Month", "days": 30, "price_usd": 29},
+        {"id": "vip_m3", "title": "3 Months", "days": 90, "price_usd": 75},
+        {"id": "vip_y1", "title": "1 Year", "days": 365, "price_usd": 249},
+        {"id": "vip_life", "title": "Lifetime", "days": 0, "price_usd": 499}
+      ]
+    },
+    {
+      "id": "basic",
+      "kind": "subscription",
+      "title": "Basic",
+      "description": "Private channel access.",
+      "chats": [],
+      "plans": [
+        {"id": "basic_m1", "title": "1 Month", "days": 30, "price_usd": 15},
+        {"id": "basic_m3", "title": "3 Months", "days": 90, "price_usd": 39}
+      ]
+    },
+    {
+      "id": "guide",
+      "kind": "digital",
+      "title": "Starter Guide (PDF)",
+      "description": "One-time purchase. Upload the file in /admin → Products → Replace content.",
+      "price_usd": 9
+    }
+  ]
+}

@@ -5,17 +5,16 @@ It checks payments on-chain, adds and removes members itself, and has referrals,
 
 ## What it does
 
-- **Plans:** as many as you want (monthly, yearly, lifetime…), edited in `plans.json`.
-- **Solana payments:** each invoice has a QR code. Phantom, Solflare or Backpack scan it as a Solana Pay link, or the buyer copies the address and amount.
-  - Payments are found **automatically** in two ways. Wallet payments are matched by their Solana Pay `reference` key. Exchange withdrawals are matched by an exact, unique amount per invoice.
-  - Every transfer is checked on-chain: the right coin, the right receiver, enough money, the transaction succeeded, and the signature was never used before.
-- **Automatic access:** after payment the buyer gets personal invite links that work once and expire in 24h. When the subscription ends, the bot removes them from every premium chat.
-- **Reminders** 3 days and 1 day before expiry, each with a *Renew* button. Renewing early adds time on top of what's left.
-- **Membership guard:** anyone who joins a premium chat without an active subscription is removed right away (turn this off with `STRICT_MEMBERSHIP=false`).
-- **Affiliate program:** each user has a referral link. Inviters earn a % of every payment their invitees make, can request a payout to their wallet, and you approve it with `/paidout`. Optional bonus days too.
-- **Promo codes:** a % discount, with a use limit and an expiry date. A 100% code gives the plan for free.
-- **Free trial:** optional, one per user.
-- **Admin panel:** `/stats` (revenue today / 30d / total, sales per coin), `/user`, `/grant`, `/revoke`, `/promo`, `/broadcast` (to all, active or inactive users), `/payouts`. You also get a message on every sale.
+- **Several products:** sell subscription tiers (for example Basic and VIP, each unlocking its own channels) and one-off digital items (files, guides, links) from one bot. The starting catalog is `catalog.json`; after that you edit everything from the **/admin** panel.
+- **Two ways to pay:**
+  - **Telegram Stars:** Telegram's in-app payment, which buyers can pay for by card. You set the rate with `STARS_PER_USD`, and refunds are one command.
+  - **Solana (SOL, USDC or USDT):** each invoice has a QR code for Solana Pay wallets. Payments are found automatically, by the invoice's `reference` key or by an exact, unique amount (so payments from exchanges work too). Every transfer is checked on-chain.
+- **Automatic access:** buyers get invite links that work once and expire in 24h. When a subscription ends they are removed from its chats, except chats that another active subscription still covers. They get reminders 3 days and 1 day before expiry.
+- **Win-back offers:** 1 day and 7 days after a subscription ends, the bot offers a comeback discount (`WINBACK_PERCENT`, 20% by default) that lasts a few days.
+- **Upsell:** when a buyer picks a plan, the bot suggests a longer plan that is cheaper per day ("3 Months — save 14%").
+- **Languages:** English, Lithuanian and Russian, picked from the user's Telegram language. Users can switch it themselves.
+- **Admin panel with buttons:** stats with a 30-day revenue chart; products, plans, prices and chats; uploading digital files; promo codes; broadcasts to all, active or inactive users; referral payouts; and settings (trial, referral %, win-back %, Stars rate, upsell).
+- **Growth tools:** referral links with a % commission and payout requests, promo codes (100% makes the item free), an optional free trial, and a membership guard that kicks people who join without paying.
 
 ## Setup (about 10 minutes)
 
@@ -23,13 +22,12 @@ It checks payments on-chain, adds and removes members itself, and has referrals,
 2. **Get your Telegram id:** message [@userinfobot](https://t.me/userinfobot).
 3. **Wallet:** use the address of a Solana wallet you control (Phantom, Solflare…).
    To take USDC/USDT, that wallet needs a USDC/USDT token account. Receiving any small amount of the token once creates it.
-4. **Premium chat:** make a *private* channel or group. Add the bot as an **admin** with *Invite users via link* and *Ban users* rights.
+4. **Premium chats:** make *private* channels or groups. Add the bot as an **admin** with *Invite users via link* and *Ban users* rights. Link each chat to a product in /admin → Products → Set chats; forwarding any channel post there adds it.
 5. **Configure:**
    ```bash
-   cp .env.example .env      # then fill in BOT_TOKEN, ADMIN_IDS, SOLANA_RECEIVER, PREMIUM_CHAT_IDS
+   cp .env.example .env      # then fill in BOT_TOKEN, ADMIN_IDS and (for crypto) SOLANA_RECEIVER
    ```
-   To find a chat id, start the bot and **forward any post from the channel to it** (admins only), or send `/chatid` inside the group.
-   Edit `plans.json` to set your prices, plans and welcome text.
+   Edit `catalog.json` for the first catalog and the welcome text (en/lt/ru). It is loaded into the database on the first start only; after that, use /admin.
 6. **Run:**
    ```bash
    docker compose up -d --build          # recommended, restarts automatically
@@ -39,18 +37,18 @@ It checks payments on-chain, adds and removes members itself, and has referrals,
 
 For real traffic, use a free RPC key from Helius, QuickNode or Alchemy (`SOLANA_RPC_URL`) instead of the rate-limited public endpoint.
 
-## Admin commands
+## Admin
+
+Send `/admin` to open the button panel. You can also use these text commands:
 
 | Command | What it does |
 |---|---|
-| `/stats` | Users, active subscriptions, revenue |
+| `/stats` | Stats and revenue chart |
 | `/user <id\|@name>` | User details |
-| `/grant <id\|@name> <days\|life>` | Give or extend access |
-| `/revoke <id\|@name>` | Remove access now |
-| `/promo CODE 30 [max_uses] [valid_days]` | Create a promo code |
-| `/promos`, `/delpromo CODE` | List or delete promo codes |
-| `/broadcast [all\|active\|inactive]` | Send it as a reply to any message (text, photo, video…) |
-| `/payouts`, `/paidout <id>` | Referral payouts |
+| `/grant <id\|@name> <days\|life> [product_id]` | Give or extend access |
+| `/revoke <id\|@name> [product_id]` | Remove access now |
+| `/refund <invoice_id>` | Refund a Telegram Stars payment and remove the access it gave |
+| `/paidout <id>` | Mark a referral payout as sent |
 
 ## How payment matching works
 
@@ -67,4 +65,4 @@ For real traffic, use a free RPC key from Helius, QuickNode or Alchemy (`SOLANA_
 pip install -r requirements.txt pytest pytest-asyncio
 pytest -q
 ```
-The tests run the whole flow (start → plan → invoice → on-chain payment → invite links → expiry, plus promo codes, trial, membership guard, admin commands and payouts). They use a fake Telegram API and a fake Solana RPC.
+The tests cover: crypto and Stars checkout, digital delivery and refund, upsell, win-back, languages, the admin panel, promo codes, trial, the membership guard and payouts. They use a fake Telegram API and a fake Solana RPC.
